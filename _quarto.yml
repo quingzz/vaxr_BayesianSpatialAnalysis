@@ -1,0 +1,8 @@
+project:
+  title: "registry_outlier"
+
+editor: visual
+
+format:
+  html:
+    theme: [cosmo, theme.scss]

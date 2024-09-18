@@ -1,0 +1,726 @@
+---
+title: "Registry Outliers"
+page-navigation: true
+toc: true
+df-print: paged
+code-fold: true
+format: 
+  html:
+    embed-resources: true
+---
+
+```{r, echo=FALSE, output = FALSE, warning=FALSE}
+library(tidyverse)
+library(downloadthis)
+library(plotly)
+library(sf)
+library(leaflet)
+library(leafpop)
+library(gt)
+```
+
+```{r data loading, echo = FALSE}
+data_path <- "data"
+# load measles data
+measles <- readRDS(file.path(data_path, "nshot_commune_month_age", "nshot_commune_month_age_mea_sure.rds"))
+
+# load commune birth data
+birth_data <- readRDS(file.path(data_path, "nborn_commune_month_sure_final.rds"))
+
+# load estimated population data
+population_data <- readRDS(file.path(data_path, "vnm_commune_population.rds"))
+
+# load location keys
+location <- readRDS(file.path(data_path, "location_full_likely.rds"))
+# load map data
+vn_map <- readRDS(file.path(data_path, "vnm_commune_alldata.rds")) 
+
+# compute map data for higher administrative level
+province_map <- vn_map %>% group_by(VID_1) %>% 
+  summarize(geometry = st_union(geometry)) %>% ungroup()
+district_map <- vn_map %>% group_by(VID_2) %>% 
+  summarize(geometry = st_union(geometry)) %>% ungroup()
+```
+
+## Differences in birth data
+
+### Compare birth data by residential address vs first vaccination location
+
+T-test at both province and commune level suggests a difference in birth count computed by residential address and first vaccination location
+
+Binh Dinh are excluded before testing since we don't have any data where vaccination location is Binh Dinh
+
+```{r, warning = FALSE, message = FALSE}
+# aggregate to birth data per year at commune level
+aggregated_birth <- birth_data %>% 
+  group_by(VID_1, VID_3, year) %>% 
+  summarize(
+    nborn_doc = sum(nborn_doc, na.rm = TRUE),
+    nborn_vac = sum(nborn_vac, na.rm = TRUE)
+  ) %>% 
+  ungroup() %>% 
+  left_join(
+    location %>% 
+      select(VID_3,province,  district, commune) %>% unique(), 
+    by = join_by(VID_3 == VID_3)
+  ) 
+
+```
+
+Compare birth count at **commune level**
+
+```{r}
+# histogram for birth count difference 
+# ggplotly(
+#   ggplot(data = aggregated_birth) +
+#   geom_histogram(
+#     aes(x = abs(nborn_doc - nborn_vac)), fill = "blue", alpha = 0.5
+#   ) 
+# )
+
+# compare birth data from vaccination vs residential address
+# t-test suggest significant difference
+# exclude Binh Dinh before comparison
+with(aggregated_birth, {
+  # log10 due to right skewed data
+  t.test(log10(nborn_doc[!(VID_1 == 52)] + 1) - log10(nborn_vac[!(VID_1 == 52)] + 1))
+})
+```
+
+Compare birth count at **province level**
+
+```{r}
+# exclude Binh Dinh before comparison
+with(aggregated_birth %>% 
+       group_by(VID_1, year) %>% 
+       summarize(nborn_doc = sum(nborn_doc, na.rm = TRUE), 
+                 nborn_vac = sum(nborn_vac, na.rm = TRUE)), {
+  # log10 due to right skewed data
+  t.test(log10(nborn_doc[!(VID_1 == 52)] + 1) - log10(nborn_vac[!(VID_1 == 52)] + 1))
+})
+```
+
+### Geo plot for birth data
+
+Visualize difference in number of births computed by residential address (birth count by doc) or first location of vaccination (birth count by vac)
+
+::: panel-tabset
+$Ratio = \frac{\text{Birth count by vac}}{\text{Birth count by doc}}$
+:::
+
+-   Birth data for Binh Dinh computed by vac is 0 for all years since registry does not have data with registered address (nborn_vac) from Binh Dinh
+-   The birth count ratio for Binh Duong is much higher relative to other provinces
+
+*Click on each province to view changes in birth count for that district over time*
+
+```{r, echo = FALSE, warning=FALSE, message = FALSE}
+birth_data_plot <- birth_data %>% 
+  group_by(VID_1, year) %>% 
+  summarize(
+    # compute birth count by year instead of month 
+    nborn_doc = sum(nborn_doc, na.rm = TRUE),
+    nborn_vac = sum(nborn_vac, na.rm = TRUE)
+  )  %>% 
+  ungroup() %>% 
+  group_by(
+    # create plot for each province
+    VID_1
+  ) %>% 
+  do(
+    vac_doc_ratio = sum(.$nborn_vac)/sum(.$nborn_doc),
+    birth_count_plot = ggplot(.) + 
+      geom_line(aes(x = year, y = nborn_vac, color = "vac")) +
+      geom_line(aes(x = year, y = nborn_doc, color = "doc")) +
+      labs(
+        x = "Year of birth",
+        y = "Number of births"
+      ) +
+      scale_color_manual(
+        values = c("vac" = "red", "doc" = "blueviolet")
+      )
+  ) 
+
+
+birth_data_plot$vac_doc_ratio <- unlist(birth_data_plot$vac_doc_ratio)
+birth_data_plot <- vn_map %>% 
+  # mutate(province_district = paste(province, district, sep = "_")) %>% 
+      group_by(VID_1, province) %>% 
+      summarize(
+        geometry = st_union(geometry)
+      ) %>% 
+  ungroup() %>% 
+  left_join(
+    # join with map data for plotting
+    birth_data_plot,
+    by = join_by(VID_1 == VID_1)
+  )
+
+
+# prepare palette 
+pal <- colorBin(palette = c("#dce7fa", "#75aaff", "#204d96"), domain = birth_data_plot$vac_doc_ratio[birth_data_plot$vac_doc_ratio > 0], bin = 4)
+labels <- sprintf("<strong> %s </strong> <br/> Count ratio: %f", birth_data_plot$province, birth_data_plot$vac_doc_ratio) %>%
+    lapply(htmltools::HTML)
+
+# plot birth count ratio and discrepancies overtime
+birth_data_plot %>% 
+  leaflet() %>% 
+  addPolygons(color = "grey", weight = 1, label = labels,
+                fillColor = ~pal(vac_doc_ratio), fillOpacity = 0.8, group = "birth_count") %>%
+    addLegend(pal = pal, values = ~vac_doc_ratio, opacity = 0.5, title = "Ratio", position = "bottomright") %>%
+  addPopupGraphs(birth_data_plot$birth_count_plot, group = "birth_count", width = 600, height = 400)
+```
+
+### Birth count by province over the year
+
+::: panel-tabset
+### Compute nborn by vac
+
+```{r, warning=FALSE, message = FALSE}
+ggplotly(
+  birth_data %>% 
+  filter(year > 2014) %>% 
+  group_by(VID_1, year) %>% 
+  summarize(
+    nborn = sum(nborn_vac, na.rm=TRUE)
+  ) %>% 
+  left_join(
+    location %>% select(VID_1, province) %>% unique(), 
+    by = join_by(VID_1 == VID_1)) %>% 
+  ggplot() +
+  geom_line(aes(x = year, y = nborn, color = province))
+)
+```
+
+### Compute nborn by doc
+
+```{r, warning=FALSE, message = FALSE}
+ggplotly(
+  birth_data %>% 
+  filter(year > 2014) %>% 
+  group_by(VID_1, year) %>% 
+  summarize(
+    nborn = sum(nborn_doc, na.rm=TRUE)
+  ) %>% 
+  left_join(
+    location %>% select(VID_1, province) %>% unique(), 
+    by = join_by(VID_1 == VID_1)) %>% 
+  ggplot() +
+  geom_line(aes(x = year, y = nborn, color = province))
+)
+```
+:::
+
+10,557 communes where there were at least 1 year where birth count = 0
+
+```{r}
+commune_w_no_birth <- birth_data %>% 
+  left_join(
+    location %>% select(VID_3, province, district, commune) %>% unique(),
+    by = join_by(VID_3 == VID_3)
+  ) %>% 
+  filter(
+    nborn_doc == 0 | nborn_vac == 0
+  ) %>% 
+  select(VID_3, province, district, commune) %>% unique()
+commune_w_no_birth
+```
+
+```{r}
+download_this(
+  commune_w_no_birth,
+  button_label = "Download communes with at least 1 year with 0 birth count",
+  output_name = "communes_no_birth",
+  output_extension = ".rds",
+  button_type = "primary",
+  has_icon = TRUE,
+  icon = "fa fa-save"
+)
+```
+
+### Compare with population from Worldpop
+
+Compute ratio with data estimated by world pop ($\frac{\text{birth count per commune per year}}{\text{WorldPop esimation for population for 0-12m age group}}$ ) to identify communes with low birth counts compared to WorldPop's estimation
+
+Record is consider outlier if computed ratio \< 20% quantile of all computed ratio
+
+```{r, message = FALSE}
+potential_outlier_birth_count <- birth_data %>%  
+  filter(year > 2014, year < 2022) %>% 
+  group_by(VID_3, year) %>% 
+  summarize(
+    nborn_vac = sum(nborn_vac, na.rm = TRUE), 
+    nborn_doc = sum(nborn_doc, na.rm = TRUE)
+  ) %>% 
+  ungroup() %>% 
+  left_join(
+    population_data %>% 
+      select(VID_3, year, age_00) %>% 
+      mutate(year = as.numeric(year)) %>% unique(),
+    by = join_by(VID_3 == VID_3, year == year)
+  ) %>% 
+  left_join(
+    location %>% select(VID_3, province, district, commune) %>% unique(),
+    by = join_by(VID_3 == VID_3)
+  ) %>% 
+  filter(
+    # filter out instances where nborn is 0
+    nborn_vac > 0 & nborn_doc > 0,
+    # filter out instances where count in worlpop < count in registry data as those are likely 
+    # due to underestimation
+    (age_00 > nborn_vac)|(age_00 > nborn_doc)
+  ) %>% 
+  mutate(
+    vac_worldpop_ratio = nborn_vac/age_00,
+    doc_worldpop_ratio = nborn_doc/age_00
+  ) %>% filter(
+    vac_worldpop_ratio < quantile(vac_worldpop_ratio, 0.2)
+  ) %>% 
+  arrange(nborn_vac, nborn_doc)
+potential_outlier_birth_count
+```
+
+```{r}
+download_this(
+  potential_outlier_birth_count,
+  button_label = "Download data table",
+  output_name = "potential_outlier_birth_count",
+  output_extension = ".rds",
+  button_type = "primary",
+  has_icon = TRUE,
+  icon = "fa fa-save"
+)
+```
+
+## Compare measles vaccination count computed by different type of addresses
+
+```{r, echo = FALSE, message = FALSE}
+shot_by_commune <- measles %>% 
+  group_by(
+    VID_3, loctype, year
+  ) %>% 
+  summarize(
+    nshot = sum(nshot)
+  ) %>% ungroup() %>% 
+  left_join(
+    location %>% 
+      select(VID_3, province, district, commune) %>% 
+      unique(), 
+    by = join_by(VID_3 == VID_3)
+  ) 
+```
+
+Comparing nshot between `loctype == "vac"` (nshot computed by first vaccination place) `loctype == "ignore"` (nshot computed by the address of vaccination registration) and `loctype == "doc"` (nshot computed by residential address)
+
+Both t-test and Wilcoxon rank sum test suggests similarity between nshot with `loctype == "vac"` and `loctype == "ignore"` while nshot computed with `loctype == "doc"` is slightly different
+
+```{r}
+loctypes <- c("doc", "ignore", "vac")
+loctype_pairs <- list(c(1,2), c(2,3), c(1,3))
+for (idx_pair in loctype_pairs){
+  print(paste0(">> Check ", paste(loctypes[idx_pair], collapse = ", "), " pair"))
+  
+  # compare using t test 
+  # log2 due to rightly skewed data
+  print(t.test(log2(nshot) ~ loctype, pairwise = TRUE, data = shot_by_commune, subset = loctype %in% loctypes[idx_pair]))
+  # compare using wilcoxon ranking test
+  print(wilcox.test(nshot ~ loctype, pairwise = TRUE, data = shot_by_commune, subset = loctype %in% loctypes[idx_pair]))
+}
+```
+
+### Geo plot for comparison
+
+::: panel-tabset
+### Comparison at province level
+
+$Ratio = \frac{\text{Vaccount per province by vac}}{\text{Vaccount per province by doc}}$
+
+```{r, echo = FALSE, message=FALSE}
+filter_loctype <- "ignore"
+
+vacc_data_plot <- measles %>% 
+  group_by(VID_1, loctype, year) %>% 
+  summarize(
+    # compute birth count by year instead of month 
+    nshot = sum(nshot, na.rm = TRUE)
+  )  %>% 
+  ungroup() %>% 
+  group_by(
+    # create plot for each province
+    VID_1
+  ) %>% 
+  do(
+    vac_doc_ratio = sum(ifelse(.$loctype == "vac", .$nshot, 0))/
+      (sum(ifelse(.$loctype == "doc", .$nshot, 0)) + 1),
+    
+    vacc_count_plot = ggplot(.) + 
+      geom_line(aes(x = year, y = nshot, color = loctype)) +
+      labs(
+        x = "Year of birth",
+        y = "Vaccination count"
+      ) 
+  ) 
+
+
+vacc_data_plot$vac_doc_ratio <- unlist(vacc_data_plot$vac_doc_ratio)
+vacc_data_plot <- vn_map %>% 
+  # mutate(province_district = paste(province, district, sep = "_")) %>% 
+      group_by(VID_1, province) %>% 
+      summarize(
+        geometry = st_union(geometry)
+      ) %>% 
+  ungroup() %>% 
+  left_join(
+    # join with map data for plotting
+    vacc_data_plot,
+    by = join_by(VID_1 == VID_1)
+  )
+
+
+# prepare palette 
+pal <- colorBin(palette = c("#dce7fa", "#75aaff", "#204d96"), domain = vacc_data_plot$vac_doc_ratio[vacc_data_plot$vac_doc_ratio > 0], bin = 4)
+labels <- sprintf("<strong> %s </strong> <br/> Ratio: %f", vacc_data_plot$province, vacc_data_plot$vac_doc_ratio) %>%
+    lapply(htmltools::HTML)
+
+# plot birth count ratio and discrepancies overtime
+vacc_data_plot %>% 
+  leaflet() %>% 
+  addPolygons(color = "grey", weight = 1, label = labels,
+                fillColor = ~pal(vac_doc_ratio), fillOpacity = 0.8, group = "vacc_count") %>%
+    addLegend(pal = pal, values = ~vac_doc_ratio, opacity = 0.5, title = "Ratio", position = "bottomright") %>%
+  addPopupGraphs(vacc_data_plot$vacc_count_plot, group = "vacc_count", width = 600, height = 400)
+```
+
+### Comparison at district level
+
+::: panel-tabset
+$Ratio = \frac{\text{Vaccount per district by vac}}{\text{Vaccount per district by doc}}$
+:::
+
+```{r echo = FALSE, message=FALSE}
+filter_loctype <- "ignore"
+
+vacc_district_plot <- measles %>% 
+  group_by(VID_2, loctype, year) %>% 
+  summarize(
+    # compute birth count by year instead of month 
+    nshot = sum(nshot, na.rm = TRUE)
+  )  %>% 
+  ungroup() %>% 
+  group_by(
+    # create plot for each commune
+    VID_2
+  ) %>% 
+  do(
+    vac_doc_ratio = sum(ifelse(.$loctype == "vac", .$nshot, 0))/
+      (sum(ifelse(.$loctype == "doc", .$nshot, 0)) + 1),
+    
+    vacc_count_plot = ggplot(.) + 
+      geom_line(aes(x = year, y = nshot, color = loctype)) +
+      labs(
+        x = "Year of birth",
+        y = "Vaccination count"
+      ) 
+  ) 
+
+
+vacc_district_plot$vac_doc_ratio <- unlist(vacc_district_plot$vac_doc_ratio)
+vacc_district_plot <- vn_map %>% 
+    mutate(district = paste(province, district, sep = "_")) %>%
+      group_by(VID_2, district) %>% 
+      summarize(
+        geometry = st_union(geometry)
+      ) %>% 
+  ungroup() %>% 
+  left_join(
+    # join with map data for plotting
+    vacc_district_plot,
+    by = join_by(VID_2 == VID_2)
+  )
+
+
+# prepare palette 
+# pal <- colorNumeric(palette = c("#a7c4f2", "#75aaff", "#204d96"), domain = vacc_data_plot$vac_doc_ratio)
+pal <- colorBin(palette = c("#dce7fa", "#75aaff", "#204d96"), domain = vacc_district_plot$vac_doc_ratio[vacc_district_plot$vac_doc_ratio > 0], bin = 4)
+labels <- sprintf("<strong> %s </strong> <br/> Ratio: %f", vacc_district_plot$district, vacc_district_plot$vac_doc_ratio) %>%
+    lapply(htmltools::HTML)
+
+# plot birth count ratio and discrepancies overtime
+vacc_district_plot %>% 
+  leaflet() %>% 
+  addPolygons(color = "grey", weight = 1, label = labels,
+                fillColor = ~pal(vac_doc_ratio), fillOpacity = 0.8, group = "vacc_count_district") %>%
+    addLegend(pal = pal, values = ~vac_doc_ratio, opacity = 0.5, title = "Ratio", position = "bottomright") 
+```
+:::
+
+## Identify potential outliers in vaccination count
+
+::: callout-note
+Vaccount computed by `loctype == "ignore"` is used for outlier detection
+:::
+
+### Detect potential vaccination count outliers for communes
+
+Identify communes that have low vaccination count relative to the vaccination count of other communes in the same district
+
+Metrics to identify outlier communes for each district is as followed
+
+-   Based on mean: $\text{std\_diff\_fr\_mean} = \frac{\text{vaccount\_commune - mean\_vaccount}}{\text{sd\_vaccount}}$
+
+    -   `vaccount_commune` is vaccination count for each commune
+
+    -   `mean_vaccount` is mean vaccination count per commune for the corresponding district
+
+    -   `sd_vaccount` is standard deviation for vaccination per commune for the corresponding district
+
+-   Based on median: $\text{std\_diff\_fr\_median} = \frac{\text{vaccount\_commune - median\_vaccount}}{\text{mad\_vaccount}}$
+
+    -   `vaccount_commune` is vaccination count for each commune
+
+    -   `median_vaccount` is median vaccination count per commune for the corresponding district
+
+    -   `mad_vaccount` is the median absolute deviation per commune for the corresponding district
+
+Additional computed metric:
+
+-   Compute proportion of vaccination count of each commune relative to it's district i.e. $\frac{\text{total vaccination of commune}}{\text{total vaccination of district}}$
+
+Vaccount for a commune is considered outlier if
+
+-   $\text{std\_diff\_fr\_mean} < \text{qnorm (0.2, mean = mean(std\_diff\_fr\_mean), sd = sd(std\_diff\_fr\_mean))}$
+
+-   OR $\text{std\_diff\_fr\_median} < \text{qnorm (0.2, mean = mean(std\_diff\_fr\_median), sd = sd(std\_diff\_fr\_median))}$
+
+```{r, warning=FALSE, message=FALSE}
+filter_loctype <- "ignore"
+props_commune_district <- measles %>% 
+  filter(
+    # keep entries for specified location type
+    loctype == filter_loctype,
+    !is.na(VID_1)) %>% 
+  group_by(VID_1, VID_2, VID_3) %>% 
+  summarize(
+    # summarize to collapse result
+    vaccount_commune = sum(nshot, na.rm = TRUE)
+  ) %>% 
+  ungroup() %>% 
+  group_by(VID_2) %>% mutate(
+    vaccount_district = sum(vaccount_commune, na.rm = TRUE),
+    # median vaccount per commune for each district
+    median_vaccount = median(vaccount_commune, na.rm = TRUE),
+    # median absolute deviation 
+    mad_vaccount = mad(vaccount_commune, na.rm = TRUE),
+    # mean vaccount per district for each province
+    mean_vaccount = mean(vaccount_commune, na.rm = TRUE),
+    # compute sd 
+    sd_vaccount = sd(vaccount_commune, na.rm = TRUE)
+    ) %>% ungroup() %>% 
+  mutate(
+    prop = vaccount_commune/vaccount_district,
+    ratio_to_median = vaccount_commune/median_vaccount,
+    # compute standard deviation from mean and median
+    std_diff_fr_mean = (vaccount_commune - mean_vaccount)/sd_vaccount,
+    std_diff_fr_median = (vaccount_commune - median_vaccount)/mad_vaccount
+  ) %>% 
+  left_join(
+       location %>% select(VID_3, province, district, commune) %>% unique(),
+       by = join_by(VID_3 == VID_3)
+  )
+
+potential_commune_outliers <- props_commune_district %>% 
+  group_by(VID_2) %>% 
+  filter(
+    std_diff_fr_median < qnorm(0.2, mean = mean(std_diff_fr_median), 
+                               sd = sd(std_diff_fr_median)) |
+    std_diff_fr_mean < qnorm(0.2, mean = mean(std_diff_fr_mean), sd = sd(std_diff_fr_mean))
+    ) %>% 
+  ungroup() %>% 
+  arrange(VID_2, std_diff_fr_median, std_diff_fr_mean)
+
+potential_commune_outliers %>% relocate(VID_1, VID_2, VID_3, province, district, commune) %>% 
+  arrange(vaccount_commune)
+```
+
+```{r, echo=FALSE}
+download_this(
+  potential_commune_outliers,
+  button_label = "Download commune with low vaccounts",
+  output_name = "potential_commune_outliers",
+  output_extension = ".rds",
+  button_type = "primary",
+  has_icon = TRUE,
+  icon = "fa fa-save"
+)
+```
+
+### Detect potential vaccination count outliers for districts
+
+Similar to the process of detecting communes with low vaccination count, the metrics for detecting outlier districts are as followed
+
+```{=html}
+<details>
+  <summary>
+    Computed metrics
+  </summary>
+```
+Metrics to identify outlier district for each province Based on mean:
+
+-   Based on mean: $\text{std\_diff\_fr\_mean} = \frac{\text{vaccount\_district - mean\_vaccount}}{\text{sd\_vaccount}}$
+
+    -   `vaccount_district` is vaccination count for each district
+
+    -   `mean_vaccount` is mean vaccination count per district for the corresponding province
+
+    -   `sd_vaccount` is standard deviation for vaccination per district for the corresponding province
+
+-   Based on median: $\text{std\_diff\_fr\_median} = \frac{\text{vaccount\_district - median\_vaccount}}{\text{mad\_vaccount}}$
+
+    -   `vaccount_district` is vaccination count for each district
+
+    -   `median_vaccount` is median vaccination count per district for the corresponding province
+
+    -   `mad_vaccount` is the median absolute deviation per district for the corresponding province
+
+Additional computed metric:
+
+-   Compute proportion of vaccination count of each commune relative to it's district i.e. $\frac{\text{total vaccination of commune}}{\text{total vaccination of district}}$
+
+</details>
+
+District with low vaccination count: Cồn Cỏ, Trường Sa, Bạch Long Vĩ (islands of Vietnam)
+
+```{r, warning = FALSE, message=FALSE}
+# separate aggregate at district level
+filter_loctype <- "ignore"
+props_district_province <- measles %>% 
+  filter(
+    # keep entries for specified location type
+    loctype == filter_loctype,
+    !is.na(VID_1)) %>% 
+  group_by(VID_1, VID_2) %>% 
+  summarize(
+    # summarize to collapse result
+    vaccount_district = sum(nshot, na.rm = TRUE)
+  ) %>% 
+  ungroup() %>% 
+  group_by(VID_1) %>% mutate(
+    vaccount_province = sum(vaccount_district, na.rm = TRUE),
+    # median vaccount per district for each province
+    median_vaccount = median(vaccount_district, na.rm = TRUE),
+    # median absolute deviation 
+    mad_vaccount = mad(vaccount_district, na.rm = TRUE),
+    # mean vaccount per district for each province
+    mean_vaccount = mean(vaccount_district, na.rm = TRUE),
+    # compute sd 
+    sd_vaccount = sd(vaccount_district, na.rm = TRUE)
+    ) %>% ungroup() %>% 
+  mutate(
+    prop = vaccount_district/vaccount_province,
+    ratio_to_median_district = vaccount_district/median_vaccount,
+    # compute standard deviation from mean and median
+    std_diff_fr_mean = (vaccount_district - mean_vaccount)/sd_vaccount,
+    std_diff_fr_median = (vaccount_district - median_vaccount)/mad_vaccount
+  ) %>% 
+  left_join(
+       location %>% select(VID_2, province, district) %>% unique(),
+       by = join_by(VID_2 == VID_2)
+  )
+
+potential_district_outliers <- props_district_province %>% 
+  group_by(VID_1) %>% 
+  filter(
+    std_diff_fr_median < qnorm(0.2, mean = mean(std_diff_fr_median), 
+                               sd = sd(std_diff_fr_median)) |
+    std_diff_fr_mean < qnorm(0.2, mean = mean(std_diff_fr_mean), sd = sd(std_diff_fr_mean))
+    ) %>% 
+  ungroup() %>% 
+  arrange(VID_1, std_diff_fr_median, std_diff_fr_mean)
+
+potential_district_outliers %>% arrange(vaccount_district) %>% 
+  relocate(VID_1, VID_2, province, district)
+```
+
+```{r, echo=FALSE}
+download_this(
+  potential_district_outliers,
+  button_label = "Download districts with low vaccounts",
+  output_name = "potential_district_outliers",
+  output_extension = ".rds",
+  button_type = "primary",
+  has_icon = TRUE,
+  icon = "fa fa-save"
+)
+```
+
+### Geo map
+
+#### Geo map for vaccount density for each district relative to its province
+
+$$
+Prop = \frac{\text{vaccount for district}}{\text{vaccount for the corresponding province}}
+$$
+
+```{r}
+to_plot <- district_map %>% 
+    left_join(
+      props_district_province %>% 
+       select(VID_2, district, province, prop) %>% 
+       mutate(label = paste(district, province, sep = "_")),
+      by = join_by(VID_2 == VID_2)
+    ) 
+
+pal <- colorBin(palette = "Blues", 
+                domain = to_plot$prop[to_plot$prop > 0], bin = 8)
+labels <- sprintf("<strong> %s </strong> <br/> Prop: %f", 
+                  paste(to_plot$province,
+                        to_plot$district), 
+                  to_plot$prop) %>%
+      lapply(htmltools::HTML)
+
+# plot propotion of vaccount
+to_plot %>%
+    leaflet() %>% 
+    addPolygons(color = "grey", weight = 1, label = labels,
+                  fillColor = ~pal(prop), fillOpacity = 0.8, group = "vaccount_prop") %>%
+    addPolygons(
+      # add province border
+      data = province_map,
+      weight = 1, fill=FALSE, color = "black", group = "vaccount_prop"
+    ) %>%
+  addLegend(pal = pal, values = ~prop, opacity = 0.5, title = "Prop", position = "bottomright") 
+```
+
+### Vaccount over estimated population density
+
+Identify communes with low vaccount relative to its population density (use population density estimated by WorldPop in 2020 as the estimation improves over times)
+
+Commune is consider outlier if `vaccount_over_density` \< 15% quantile of all `vaccount_over_density` where `vaccount_over_density = vaccount_commune/density`
+
+```{r}
+props_commune_district %>% 
+  left_join(
+    population_data %>% filter(year == 2020) %>% select(VID_3, density),
+    by = join_by(VID_3 == VID_3)
+  ) %>% 
+  mutate(
+    vaccount_over_density = as.numeric(vaccount_commune/density)
+  ) %>% 
+  filter (
+    vaccount_over_density < quantile(vaccount_over_density, 0.15, na.rm=TRUE)
+  )  %>% 
+  select(
+    # rearrange columns 
+    VID_3, province, district, commune, vaccount_over_density, vaccount_commune
+  ) %>% arrange(vaccount_commune)
+```
+
+Communes with no estimated density
+
+```{r}
+props_commune_district %>% 
+  anti_join(
+   population_data %>% filter(year == 2020) %>% select(VID_3, density),
+    by = join_by(VID_3 == VID_3)
+  ) %>% 
+  relocate(VID_1, VID_2, VID_2, province, district, commune)
+```
